@@ -1,154 +1,151 @@
-from __future__ import division
-from __future__ import print_function
-
-import os
-import glob
-import time
-import random
-import argparse
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.autograd import Variable
+import time
+import serial
+import os
+import sys
 
-from utils import load_data, accuracy
-from models import GAT, SpGAT
-
-# Training settings
-parser = argparse.ArgumentParser()
-parser.add_argument('--no-cuda', action='store_true', default=False, help='Disables CUDA training.')
-parser.add_argument('--fastmode', action='store_true', default=False, help='Validate during training pass.')
-parser.add_argument('--sparse', action='store_true', default=False, help='GAT with sparse version or not.')
-parser.add_argument('--seed', type=int, default=72, help='Random seed.')
-parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train.')
-parser.add_argument('--lr', type=float, default=0.005, help='Initial learning rate.')
-parser.add_argument('--weight_decay', type=float, default=5e-4, help='Weight decay (L2 loss on parameters).')
-parser.add_argument('--hidden', type=int, default=8, help='Number of hidden units.')
-parser.add_argument('--nb_heads', type=int, default=8, help='Number of head attentions.')
-parser.add_argument('--dropout', type=float, default=0.6, help='Dropout rate (1 - keep probability).')
-parser.add_argument('--alpha', type=float, default=0.2, help='Alpha for the leaky_relu.')
-parser.add_argument('--patience', type=int, default=100, help='Patience')
-
-args = parser.parse_args()
-args.cuda = not args.no_cuda and torch.cuda.is_available()
-
-random.seed(args.seed)
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
-if args.cuda:
-    torch.cuda.manual_seed(args.seed)
-
-# Load data
-adj, features, labels, idx_train, idx_val, idx_test = load_data()
-
-# Model and optimizer
-if args.sparse:
-    model = SpGAT(nfeat=features.shape[1], 
-                nhid=args.hidden, 
-                nclass=int(labels.max()) + 1, 
-                dropout=args.dropout, 
-                nheads=args.nb_heads, 
-                alpha=args.alpha)
-else:
-    model = GAT(nfeat=features.shape[1], 
-                nhid=args.hidden, 
-                nclass=int(labels.max()) + 1, 
-                dropout=args.dropout, 
-                nheads=args.nb_heads, 
-                alpha=args.alpha)
-optimizer = optim.Adam(model.parameters(), 
-                       lr=args.lr, 
-                       weight_decay=args.weight_decay)
-
-if args.cuda:
-    model.cuda()
-    features = features.cuda()
-    adj = adj.cuda()
-    labels = labels.cuda()
-    idx_train = idx_train.cuda()
-    idx_val = idx_val.cuda()
-    idx_test = idx_test.cuda()
-
-features, adj, labels = Variable(features), Variable(adj), Variable(labels)
+from utils import *
 
 
-def train(epoch):
-    t = time.time()
-    model.train()
-    optimizer.zero_grad()
-    output = model(features, adj)
-    loss_train = F.nll_loss(output[idx_train], labels[idx_train])
-    acc_train = accuracy(output[idx_train], labels[idx_train])
-    loss_train.backward()
-    optimizer.step()
+class TrafficAgent():
+    def __init__(self):
+        
+        self.time0 = 0
+        self.eff_main_cost = 2.0
+        self.eff_add_cost = 1
+        self.period_time = 80.0
+        self.ser = serial.Serial("COM7", 19200, timeout=5)
+        self.ser.parity = 'E'
+        self.embedding = nn.Embedding(2, 24)
+        self.embedding2 = nn.Embedding(2, 1) 
+        self.light_state = [0, 1]   # init light state
 
-    if not args.fastmode:
-        # Evaluate validation set performance separately,
-        # deactivates dropout during validation run.
-        model.eval()
-        output = model(features, adj)
+    def get_reward(self, action,add_flag=True):
+        ### the main cost value
+        fh = open(COST_FILE, 'r') 
+        main_cost =fh.read()
+        while(main_cost == ''):
+            main_cost = fh.read()
+        fh.close()
+        main_cost = float(main_cost)
 
-    loss_val = F.nll_loss(output[idx_val], labels[idx_val])
-    acc_val = accuracy(output[idx_val], labels[idx_val])
-    print('Epoch: {:04d}'.format(epoch+1),
-          'loss_train: {:.4f}'.format(loss_train.data.item()),
-          'acc_train: {:.4f}'.format(acc_train.data.item()),
-          'loss_val: {:.4f}'.format(loss_val.data.item()),
-          'acc_val: {:.4f}'.format(acc_val.data.item()),
-          'time: {:.4f}s'.format(time.time() - t))
+        ### an additional cost value
+        add_cost = 0
+        if add_flag:
+            vel_pos = self.get_vehicle_position()
+            a, b = np.ones(48), np.zeros(48)
+            v1 = np.concatenate((a,b,b,b,a,b,b,b),axis=0)
+            v2 = np.concatenate((b,b,a,b,b,b,a,b),axis=0)
+            c1 = np.float(np.dot(vel_pos.reshape(1,-1), v1))
+            c2 = np.float(np.dot(vel_pos.reshape(1,-1), v2))
+            #add_cost = 0.7 * c1 + 0.3 * c2
+        ### TODO: add cost
+        if((self.light_state==[0,1]).all()):
+            if(action[0]==1):
+                if(c1>4):
+                    add_cost+=20
+        if((self.light_state==[1,0]).all()):
+            if(action[1]==1):
+                if((c2<4)&((time.time()-self.time0)>25)):
+                    add_cost+=20   
+        ### compute the total cost value
+        total_cost = self.eff_main_cost * main_cost + self.eff_add_cost * add_cost
+        reward = np.array(-total_cost).astype(np.float32)
+        reward = torch.from_numpy(reward).unsqueeze(0)
+        return reward 
 
-    return loss_val.data.item()
+    def traffic_light(self):
+        #### get the traffic light info
+        fL=open(TRAFFIC_FILE, 'r')
+        temp=fL.read()
+        while(temp==''):
+            temp = fL.read()
+        light=np.zeros(2)
+        light[0]=temp[0]
+        light[1]=temp[1]
+        fL.close()
+        return light 
 
+    def sync(self):
+        #### syncronizing light period
+        sign = self.traffic_light()
+        light = self.traffic_light()
+        print('Syncronizing light period...')
+        while((sign == light).all()):
+            fL = open(TRAFFIC_FILE, 'r')
+            temp = fL.read()
+            while(temp==''):
+                temp = fL.read()
+            light=np.zeros(2)
+            light[0]=temp[0]
+            light[1]=temp[1]
+        self.time0 = time.time()
+        self.light_state = light
+        fL.close()
+    
+    def get_vehicle_position(self):
+        while(True):  
+            vel_pos = []
+            for k in list(range(1, 9)):
+                fL = open(os.path.join(VEL_POSTION_DIR, 'log_direction{}.txt'.format(str(k))), 'r')
+                while(True):
+                    temp = fL.readlines()
+                    if (np.size(temp)!=0): 
+                        break
+                fL.close()
+                l = len(temp)
+                for i in range(l): 
+                    temp[i] = temp[i].strip() 
+                    temp[i] = temp[i].strip('[]') 
+                    temp[i] = temp[i].split(",")
+                    temp[i] = self.embedding2(torch.LongTensor([np.array(temp[i]).astype(np.float32)]))
+                #vel_pos.append(np.array(temp).astype(np.float32).reshape(1,48))
+                vel_pos.append(np.array(temp).reshape(48))
+            vel_pos = np.array(vel_pos).astype(np.float32)
+            if vel_pos.shape==(8,48):
+                fL.close()
+                break       
+        return vel_pos
 
-def compute_test():
-    model.eval()
-    output = model(features, adj)
-    loss_test = F.nll_loss(output[idx_test], labels[idx_test])
-    acc_test = accuracy(output[idx_test], labels[idx_test])
-    print("Test set results:",
-          "loss= {:.4f}".format(loss_test.data[0]),
-          "accuracy= {:.4f}".format(acc_test.data[0]))
+    def get_light_info(self):
+        light = self.traffic_light()
+        if((light != self.light_state).all()):
+            self.time0 = time.time()
+            self.light_state = light
+        light = self.light_state[0]
 
-# Train model
-t_total = time.time()
-loss_values = []
-bad_counter = 0
-best = args.epochs + 1
-best_epoch = 0
-for epoch in range(args.epochs):
-    loss_values.append(train(epoch))
+        N9FirstHalf = self.embedding(torch.LongTensor([light]))  # light = 0 or 1
+        longOflight = time.time() - self.time0
+        N9SecondHalf = torch.FloatTensor(np.ones([1, 24]) * longOflight / self.period_time)
 
-    torch.save(model.state_dict(), '{}.pkl'.format(epoch))
-    if loss_values[-1] < best:
-        best = loss_values[-1]
-        best_epoch = epoch
-        bad_counter = 0
-    else:
-        bad_counter += 1
+        Node9_feat = torch.cat((N9FirstHalf, N9SecondHalf), dim=1)
+        return Node9_feat
 
-    if bad_counter == args.patience:
-        break
+    def send_action(self):
+        begin = time.time()
+        while ((time.time()-begin)<0.5):
+            self.ser.write('1\0'.encode('gbk'))
+        time.sleep(0.2)
 
-    files = glob.glob('*.pkl')
-    for file in files:
-        epoch_nb = int(file.split('.')[0])
-        if epoch_nb < best_epoch:
-            os.remove(file)
+    def get_state(self):
+        vel_pos = self.get_vehicle_position()
+        light_info = self.get_light_info()
+        state = torch.cat((torch.FloatTensor(vel_pos), light_info), dim=0)
+        return state
 
-files = glob.glob('*.pkl')
-for file in files:
-    epoch_nb = int(file.split('.')[0])
-    if epoch_nb > best_epoch:
-        os.remove(file)
+    def step(self, action):
+        reward = self.get_reward(action)
+        if(action[0]==1):
+            self.send_action()       
+        next_state = self.get_state()        
 
-print("Optimization Finished!")
-print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
+        return reward, next_state
 
-# Restore best model
-print('Loading {}th epoch'.format(best_epoch))
-model.load_state_dict(torch.load('{}.pkl'.format(best_epoch)))
+    def __del__(self):
+        self.ser.close()
 
-# Testing
-compute_test()
+        
+if __name__=='__main__':
+    pass
